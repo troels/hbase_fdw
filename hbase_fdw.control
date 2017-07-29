@@ -1,0 +1,5 @@
+# worker_spi extension
+comment = 'HBase foreign data wrapper'
+default_version = '1.0'
+module_pathname = '$libdir/hbase_fdw'
+relocatable = true
