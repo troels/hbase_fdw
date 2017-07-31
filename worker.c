@@ -21,6 +21,8 @@ typedef struct thread_data  {
 	bool shutdown_worker;
 	void *jvm_env;
 	HBaseCommand *command;
+	HBaseColumn *columns;
+	HBaseFilter *filters;
 	shm_mq_handle *tuples_mq;
 } thread_data;
 
@@ -33,14 +35,19 @@ static bool
 check_for_exit(thread_data *thread_data);
 
 void
-thread_start_worker(int n, shm_mq_handle *tuples_mq, HBaseCommand *command)
+thread_start_worker(int n, shm_mq_handle *tuples_mq,
+					HBaseCommand *command,
+					HBaseColumn *columns,
+					HBaseFilter *filters)
 {
 	thread_data *data = &threads[n];
 	pthread_mutex_lock(&data->cond_mutex);
 	data->tuples_mq = tuples_mq;
 	data->command = command;
-	pthread_mutex_unlock(&data->cond_mutex);
+	data->columns = columns;
+	data->filters = filters;
 	pthread_cond_signal(&data->cond);
+	pthread_mutex_unlock(&data->cond_mutex);
 }
 
 void
@@ -49,6 +56,8 @@ thread_reset_worker(int n)
 	thread_data *data = &threads[n];
 	data->tuples_mq = NULL;
 	data->command = NULL;
+	data->columns = NULL;
+	data->filters = NULL;
 	reset_worker(n);
 	SetLatch(MyLatch);
 }
@@ -87,13 +96,11 @@ run_worker(void *data)
 
 	pthread_mutex_lock(&thread_data->cond_mutex);
 	thread_data->jvm_env = jvm_attach_thread();
-	pg_elog(LOG, "Initialized worker %d", thread_data->worker_num);
 
 	while (!check_for_exit(thread_data)) {
-		pthread_cond_timedwait(
+		pthread_cond_wait(
 			&thread_data->cond,
-			&thread_data->cond_mutex,
-			&time);
+			&thread_data->cond_mutex);
 
 		if (thread_data->command != NULL)
 		{
@@ -103,8 +110,13 @@ run_worker(void *data)
 			scanner_data = setup_scanner(
 				thread_data->jvm_env,
 				thread_data->command->table_name,
-				thread_data->command->columns,
-				thread_data->command->nr_columns);
+				thread_data->columns,
+				thread_data->command->nr_columns,
+				thread_data->filters,
+				thread_data->command->nr_filters);
+
+			if (scanner_data.scanner == NULL)
+				more_rows = false;
 
 			while (more_rows)
 			{
@@ -112,7 +124,6 @@ run_worker(void *data)
 				HBaseFdwMessage *msg;
 				int len;
 				more_rows = scan_row(thread_data->jvm_env, &scanner_data);
-				pg_elog(WARNING, "More rows: %s", more_rows ? "yes" : "no");
 
 				if (more_rows) {
 					len = *(int*)scanner_data.ptr;

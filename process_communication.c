@@ -112,33 +112,43 @@ maintain_workers(void)
 			dsm_segment *seg;
 			shm_mq *mq;
 			shm_mq_handle *handle;
-			pg_elog(LOG, "DSM HANDLE");
+			shm_toc *toc;
+			HBaseCommand *command;
+			HBaseColumn *columns;
+			HBaseFilter *filters;
+
 			worker->is_activated = false;
 			if (worker->dsm_handle == 0)
 			{
 				pg_elog(WARNING, "Expected a dsm handle");
 				goto unlock_worker;
 			}
-			pg_elog(LOG, "DSM HANDLE: %d", worker->dsm_handle);
 			seg = dsm_attach(worker->dsm_handle);
 			if (seg == NULL)
 			{
 				pg_elog(WARNING, "Failed to find segment");
 				goto unlock_worker;
 			}
+			toc = shm_toc_attach(
+				HBASE_FDW_SHM_TOC_MAGIC,
+				dsm_segment_address(seg));
 
-			pg_elog(LOG, "Attached: %d", worker->dsm_handle);
-			mq = dsm_segment_address(seg);
+			if (toc == NULL)
+			{
+				pg_elog(WARNING, "Failed to connect to toc");
+				goto unlock_worker;
+			}
+
+			command = shm_toc_lookup(toc, 1);
+			columns = shm_toc_lookup(toc, 2);
+			filters = shm_toc_lookup(toc, 3);
+			mq = shm_toc_lookup(toc, 4);
 			shm_mq_set_sender(mq, MyProc);
 
 			handle = shm_mq_attach(mq, seg, NULL);
 			worker->is_working = true;
 			worker->seg = seg;
-			elog(LOG, "Starting worker!");
-			thread_start_worker(i, handle, &worker->command);
-		}
-		else if (worker->is_working && !thread_is_working(i))
-		{
+			thread_start_worker(i, handle, command, columns, filters);
 		}
 
 	unlock_worker:
@@ -147,24 +157,17 @@ maintain_workers(void)
 }
 
 bool
-activate_worker(char *table_name, HBaseColumn *columns, int nr_columns, dsm_handle handle)
+activate_worker(dsm_handle handle)
 {
-	if (nr_columns > HBASE_FDW_MAX_HBASE_COLUMNS)
-		elog(ERROR, "Too many columns on table");
-
 	for (int i = 0; i < control->num_workers; i++)
 	{
 		bool success = false;
 		hbase_fdw_worker *worker = &control->worker[i];
 		SpinLockAcquire(&worker->mutex);
-
 		if (!worker->is_activated && !worker->is_working && !worker->shutdown)
 		{
+			pg_elog(LOG, "Activating worker");
 			worker->is_activated = true;
-			memcpy(worker->command.columns, columns, sizeof(*columns) * nr_columns);
-			strncpy(worker->command.table_name, table_name, HBASE_FDW_MAX_TABLE_NAME_LEN);
-			worker->command.table_name[HBASE_FDW_MAX_TABLE_NAME_LEN] = '\0';
-			worker->command.nr_columns = nr_columns;
 			worker->dsm_handle = handle;
 			worker->seg = NULL;
 			success = true;

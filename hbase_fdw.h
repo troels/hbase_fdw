@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include "storage/shm_mq.h"
 #include "storage/dsm.h"
+#include "nodes/pg_list.h"
 
 #define HBASE_FDW_NUM_WORKERS 8
 #define HBASE_FDW_WORKMEM_PER_WORKER 1048576
@@ -16,6 +17,8 @@
 
 #define HBASE_FDW_MAX_ROW_KEY_FILTER_LEN 128
 #define HBASE_FDW_MAX_FILTERS 16
+
+#define HBASE_FDW_SHM_TOC_MAGIC 0x4193cf19
 
 extern pthread_mutex_t postgres_mutex;
 extern void *hbase_connector;
@@ -61,12 +64,16 @@ typedef struct HBaseFilter {
 	};
 } HBaseFilter;
 
+typedef struct HBasePreparedFilter {
+	List *params;
+	int *param_nums;
+	HBaseFilter filter;
+} HBasePreparedFilter;
+
 typedef struct HBaseCommand {
 	char table_name[HBASE_FDW_MAX_TABLE_NAME_LEN + 1];
 	int nr_filters;
 	int nr_columns;
-	HBaseFilter filters[HBASE_FDW_MAX_FILTERS];
-	HBaseColumn columns[HBASE_FDW_MAX_HBASE_COLUMNS];
 } HBaseCommand;
 
 #define with_pg_lock(ARG) \
@@ -89,7 +96,13 @@ void *jvm_attach_thread(void);
 void jvm_detach_thread(void);
 
 ScannerData
-setup_scanner(void *env_, char *table, HBaseColumn *columns, int nr_columns);
+setup_scanner(
+	void *env_,
+	char *table,
+	HBaseColumn *columns,
+	int nr_columns,
+	HBaseFilter *filters,
+	int nr_filters);
 void
 destroy_scanner(void *env_, ScannerData *scanner_data);
 bool
@@ -110,7 +123,12 @@ void destroy_hbase_connector(void);
 void allocate_threads(void);
 void shutdown_threads(void);
 
-void thread_start_worker(int n, shm_mq_handle *tuples_mq, HBaseCommand *command);
+void
+thread_start_worker(int n,
+					shm_mq_handle *tuples_mq,
+					HBaseCommand *command,
+					HBaseColumn *columns,
+					HBaseFilter *filters);
 void thread_reset_worker(int n);
 bool thread_is_working(int n);
 
@@ -126,7 +144,7 @@ void close_jvm_lib(void);
 void pg_datum(void *env, char *s);
 
 bool
-activate_worker(char *table_name, HBaseColumn *columns, int nr_columns, dsm_handle handle);
+activate_worker(dsm_handle handle);
 void
 reset_worker(int n);
 

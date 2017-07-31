@@ -24,6 +24,9 @@ static void release_scanner_bytes(void *env_, ScannerData *scanner_data);
 
 static jobject create_hbase_connector(JNIEnv *env);
 
+static jobject
+create_filters(JNIEnv *env, HBaseFilter *filters, int nr_filters);
+
 
 void open_jvm_lib(char *libjvm_path)
 {
@@ -806,12 +809,126 @@ create_pg_hbase_columns(void *env_, HBaseColumn *columns, size_t n_columns)
 	return res;
 }
 
+static jobject
+create_filters(JNIEnv *env, HBaseFilter *filters, int nr_filters)
+{
+	char *filter_creator_class_name = "org/bifrost/HBaseFilterCreator";
+	char *row_key_equals_creator_method_name = "addRowKeyEqualsFilter";
+	char *row_key_equals_creator_method_signature = "([B)V";
+	char *constructor_method_name = "<init>";
+	char *constructor_method_signature = "()V";
+	jclass filter_creator_class = NULL;
+	jmethodID constructor_method = NULL;
+	jmethodID row_key_equals_creator = NULL;
+	jobject creator = NULL;
+
+	filter_creator_class = (*env)->FindClass(env, filter_creator_class_name);
+	if (filter_creator_class == NULL)
+	{
+		log_exception(env);
+		pg_elog(WARNING, "Failed get %s class", filter_creator_class_name);
+		goto error_exit;
+	}
+
+	constructor_method = (*env)->GetMethodID(
+		env,
+		filter_creator_class,
+		constructor_method_name,
+		constructor_method_signature);
+
+	if (constructor_method == NULL)
+	{
+		log_exception(env);
+		pg_elog(WARNING, "Failed to get %s from %s",
+				constructor_method_name,
+				filter_creator_class_name);
+		goto error_exit;
+	}
+
+	row_key_equals_creator = (*env)->GetMethodID(
+		env,
+		filter_creator_class,
+		row_key_equals_creator_method_name,
+		row_key_equals_creator_method_signature);
+
+	if (row_key_equals_creator == NULL)
+	{
+		log_exception(env);
+		pg_elog(WARNING, "Failed to get %s from %s",
+				row_key_equals_creator_method_name,
+				filter_creator_class_name);
+		goto error_exit;
+	}
+
+	creator = (*env)->NewObject(
+		env,
+		filter_creator_class,
+		constructor_method);
+
+	if (creator == NULL)
+	{
+		log_exception(env);
+		pg_elog(WARNING, "Failed to create %s object",
+				filter_creator_class_name);
+		goto error_exit;
+	}
+
+	for (int i = 0; i < nr_filters; i++)
+	{
+		HBaseFilter *filter = &filters[i];
+		switch (filter->filter_type)
+		{
+			case filter_type_row_key_equals:
+			{
+				jobject row_key = make_byte_array(env,
+												  filter->row_key_equals.row_key,
+												  strlen(filter->row_key_equals.row_key));
+				if(row_key == NULL)
+				{
+					log_exception(env);
+					pg_elog(WARNING, "Failed to create row key byte array");
+					goto error_exit;
+				}
+
+				(*env)->CallVoidMethod(
+					env,
+					creator,
+					row_key_equals_creator,
+					row_key);
+
+				(*env)->DeleteLocalRef(env, row_key);
+				if ((*env)->ExceptionCheck(env))
+				{
+					log_exception(env);
+					pg_elog(WARNING, "Failed to create row_key_equals filter");
+					goto error_exit;
+				}
+				break;
+			}
+			default:
+				continue;
+		}
+	}
+
+	goto exit;
+
+ error_exit:
+	(*env)->DeleteLocalRef(env, creator);
+	creator = NULL;
+
+ exit:
+	(*env)->DeleteLocalRef(env, filter_creator_class);
+	return creator;
+}
+
 ScannerData
-setup_scanner(void *env_, char *table, HBaseColumn *c_columns, int nr_columns)
+setup_scanner(void *env_, char *table,
+			  HBaseColumn *c_columns, int nr_columns,
+			  HBaseFilter *filters, int nr_filters)
 {
 	char *make_scanner_method_name = "makeScanner";
 	char *make_scanner_method_signature =
-		"([B[Lorg/bifrost/PgHbaseColumn;)Lorg/bifrost/Scanner;";
+		"([B[Lorg/bifrost/PgHbaseColumn;Lorg/bifrost/HBaseFilterCreator;)Lorg/bifrost/Scanner;";
 	char *scan_method_name = "scan";
 	char *scan_method_signature = "()[B";
 
@@ -825,6 +942,15 @@ setup_scanner(void *env_, char *table, HBaseColumn *c_columns, int nr_columns)
 	jclass scanner_class = NULL;
 	jmethodID scan_method = NULL;
 	ScannerData res = { NULL, NULL, NULL, NULL };
+	jobject filter_obj = NULL;
+
+	filter_obj = create_filters(env, filters, nr_filters);
+	if (filter_obj== NULL)
+	{
+		log_exception(env);
+		pg_elog(WARNING, "Failed to create filters");
+		goto exit;
+	}
 
 	columns = create_pg_hbase_columns(env_, c_columns, nr_columns);
 	if (columns == NULL)
@@ -865,7 +991,9 @@ setup_scanner(void *env_, char *table, HBaseColumn *c_columns, int nr_columns)
 		hbase_connector,
 		make_scanner,
 		table_name,
-		columns);
+		columns,
+		filter_obj
+		);
 	if (local_scanner_ref == NULL || (*env)->ExceptionCheck(env))
 	{
 		log_exception(env);
@@ -910,6 +1038,7 @@ setup_scanner(void *env_, char *table, HBaseColumn *c_columns, int nr_columns)
 	(*env)->DeleteLocalRef(env, table_name);
 	(*env)->DeleteLocalRef(env, hbase_connector_class);
 	(*env)->DeleteLocalRef(env, columns);
+	(*env)->DeleteLocalRef(env, filter_obj);
 
 	if (res.scanner == NULL)
 		(*env)->DeleteGlobalRef(env, global_scanner_ref);
